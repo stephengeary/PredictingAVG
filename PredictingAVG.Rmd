@@ -1,0 +1,193 @@
+---
+title: "PhilliesBatting3"
+author: "Stephen Geary"
+date: "6/16/2020"
+output: html_document
+---
+
+This project is attempting to take in the March and April batting data 
+
+```{r setup}
+
+library(tidyverse)
+library(tidymodels)
+
+MarApr2017 <- as_tibble(read_csv("batting.csv")) %>% 
+  mutate(Team = as.factor(Team))
+
+
+head(MarApr2017)
+
+```
+
+
+```{r summary}
+
+summary(MarApr2017)
+
+#Luckily the data is clean, nothing to impute later on
+
+MarApr2017 %>% 
+  select(FullSeason_AVG) %>% 
+  ggplot(aes(FullSeason_AVG)) +
+  geom_histogram() +
+  geom_density(aes()) +
+  geom_vline(xintercept = mean(MarApr2017$FullSeason_AVG))+
+  geom_vline(xintercept = mean(MarApr2017$FullSeason_AVG)-sd(MarApr2017$FullSeason_AVG))+
+  geom_vline(xintercept = mean(MarApr2017$FullSeason_AVG)+sd(MarApr2017$FullSeason_AVG))
+  
+
+```
+
+
+
+```{r, checking correlations}
+
+library(corrr)
+
+correlations <- MarApr2017 %>% 
+  select(MarApr_PA:FullSeason_AVG) %>% 
+  correlate() %>% 
+  select(rowname, FullSeason_AVG) %>% 
+  arrange(desc(abs(FullSeason_AVG)))
+
+
+print(correlations)
+
+```
+
+
+```{r splitting data}
+
+
+set.seed(17)
+
+avg_split <- initial_split(MarApr2017, strata = FullSeason_AVG)
+avg_train <- training(avg_split)
+avg_test <- testing(avg_split)
+
+
+```
+
+First test is to see if I should worry more about over or under fitting my data. m1 will be each player's average carried over. m2 will be the mean of all March & April averages. If m2 performs better we know that a lot of what is influencing full season batting average happens after the months of March & April, no model that we create will be very predictive, data is pretty noisy, so we should focus on minimizing bias. The better performer of the two will become our measure of success
+
+```{r m1 - MarApr = Full Season}
+
+avg_test <- avg_test %>% 
+  mutate(m1 = avg_test$MarApr_AVG)
+
+```
+
+
+```{r m2 - Overall Avg}
+
+avg_test <- avg_test %>% 
+  mutate(m2 = sum(avg_train$MarApr_H)/sum(avg_train$MarApr_AB))
+
+```
+
+
+```{r Testing m1 & m2}
+
+avg_test %>%
+  metrics(FullSeason_AVG, m1)
+
+# m1 rmse = 0.04423588
+
+avg_test %>%
+  metrics(FullSeason_AVG, m2)
+
+# m2 rmse = 0.03007090
+
+
+```
+
+
+
+As m2 performed better we'll use a lasso regression to avoid overfitting and help with feature selection
+
+
+
+```{r m3 - Lasso Regression (Building Recipe)}
+
+avg_kfolds <- vfold_cv(avg_train)
+
+avg_lasso_recipe <- recipe(FullSeason_AVG ~ ., data = avg_train) %>% 
+  update_role(playerid, Name, new_role = "id") %>%
+  # step_dummy(Team, one_hot = T) %>% 
+  # update_role(contains("Team"), new_role = "predictor") %>%
+  remove_role(Team, old_role = "predictor") %>%
+  remove_role(MarApr_PA, old_role = "predictor") %>%
+  remove_role(MarApr_AB, old_role = "predictor") %>%
+  remove_role(MarApr_H, old_role = "predictor") %>%
+  remove_role(MarApr_HR, old_role = "predictor") %>%
+  remove_role(MarApr_R, old_role = "predictor") %>%
+  remove_role(MarApr_RBI, old_role = "predictor") %>%
+  remove_role(MarApr_SB, old_role = "predictor") %>%
+  # step_interact(~all_predictors():all_predictors()) %>% 
+  # step_normalize(all_numeric(), all_outcomes()) %>% 
+  # step_center(all_numeric(), all_outcomes()) %>% 
+  # remove_role(Team, old_role = "predictor") %>% 
+  prep() 
+
+#several additional role/step transformations were ultimately unused, but left in if anyone wants to explore further 
+
+```
+
+One of the first things that I wanted to do was eliminate all of the counting statistics (PAs, ABs, RBIs, etc.). All of that data will be captured elsewhere, with less emphasis on the sample size. The only stat that does not seem to be captured elsewhere is Stolen Bases, which does not correlate strongly with AVG
+
+I also included some of the other steps that I thought about working with in this recipe. Centering & Normalizing the data seemed like great ideas, but I believe that the sample size being small gave me trouble. Dummying the team variable seemed like it might provide some interesting insights, but ultimately it didn't bring much to the table and made the regression much tougher for my laptop to process. These have been included, but commented out 
+
+```{r m3 - Lasso Regression (Cont.)}
+avg_lasso_recipe %>% prep() %>% bake(avg_train %>% head()) %>% colnames() %>% length()
+
+avg_lasso_model <- linear_reg(penalty = tune(), mixture = 1) %>% 
+  set_mode("regression") %>% 
+  set_engine("glmnet")
+
+avg_lasso_info <- parameters(avg_lasso_model)
+
+lambda_grid <- grid_regular(avg_lasso_info, levels = 25)
+
+avg_lasso_wf <- workflow() %>% 
+  add_recipe(avg_lasso_recipe) %>% 
+  add_model(avg_lasso_model)
+
+avg_lasso_grid <- tune_grid(
+          avg_lasso_wf,
+          resamples = avg_kfolds, 
+          grid = lambda_grid)
+
+main_tune <- avg_lasso_grid %>%
+  select_best("rmse")
+
+avg_lasso_wf <- avg_lasso_wf %>%
+  finalize_workflow(main_tune)
+
+final_avg_model <- fit(avg_lasso_wf, avg_test)
+
+avg_test <- avg_test %>%
+  bind_cols(predict(final_avg_model, avg_test)) %>%
+  rename(m3 = .pred)
+
+avg_test %>%
+  metrics(FullSeason_AVG, m3)
+
+# rmse = 0.02093776
+
+
+```
+
+
+```{r - Visualizing}
+
+predictions <- avg_test %>% 
+  select(m1, m2, m3, FullSeason_AVG) %>% 
+  pivot_longer(-FullSeason_AVG, names_to = "model")
+
+ggplot(predictions,aes(x = FullSeason_AVG, y = value, color = model)) +
+  geom_point()  
+
+```
+
+We know that m3 performed the best across all three models, but it does look like as the player's full season average got unusually high or unusually low our model had some trouble capturing it. I thought that this may be the case with some of the decisions that we made earlier to eliminate noise. 
